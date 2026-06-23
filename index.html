@@ -1,0 +1,1643 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Depo Enerji Takip — Çoklu Kullanıcı</title>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, push, set, onValue, remove, update }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+// ══════════════════════════════════════════════════════════
+// 🔧 BURAYA KENDİ FİREBASE BİLGİLERİNİZİ GİRİN
+//    (Kurulum kılavuzu sayfanın altında)
+// ══════════════════════════════════════════════════════════
+const firebaseConfig = {
+  apiKey:            "AIzaSyB2qWL6UUyqhsG1mT6pDpQfaVxakR5ye1o",
+  authDomain:        "wea-6fcd0.firebaseapp.com",
+  databaseURL:       "https://wea-6fcd0-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId:         "wea-6fcd0",
+  storageBucket:     "wea-6fcd0.firebasestorage.app",
+  messagingSenderId: "419450224155",
+  appId:             "1:419450224155:web:abe58ae5961ef7ed8242be"
+};
+// ══════════════════════════════════════════════════════════
+
+const DEMO_MODE = firebaseConfig.apiKey === "BURAYA_API_KEY";
+
+let app, db, auth;
+let currentUser = null;
+let DATA = {};          // { firebaseKey: rowObj }
+let unsubscribe = null;
+
+if (!DEMO_MODE) {
+  app  = initializeApp(firebaseConfig);
+  db   = getDatabase(app);
+  auth = getAuth(app);
+}
+
+// ── KULLANICILAR (rol tabanlı) ──────────────────────────
+// Bu listeyi kendi ekibinize göre düzenleyin
+const KULLANICILAR = {
+  "admin@wea.com":    { ad: "Yönetici",   rol: "admin", depo: null },
+  "hatice.u@wea.com": { ad: "Hatice U.",  rol: "admin", depo: null },
+  "elif.b@wea.com":   { ad: "Elif B.",    rol: "admin", depo: null },
+};
+
+// ── AUTH DURUM DEĞİŞİMİ ────────────────────────────────
+if (!DEMO_MODE) {
+  onAuthStateChanged(auth, user => {
+    if (user) {
+      const bilgi = KULLANICILAR[user.email] || { ad: user.email, rol: "depo", depo: null };
+      currentUser = { email: user.email, ...bilgi };
+      girisYapildi();
+    } else {
+      currentUser = null;
+      loginEkraniGoster();
+    }
+  });
+} else {
+  // Demo modda otomatik admin olarak gir
+  setTimeout(() => {
+    currentUser = { email: "demo@demo.com", ad: "Demo Kullanıcı", rol: "admin", depo: null };
+    girisYapildi();
+  }, 300);
+}
+
+// ══════════════════════════════════════════════
+// GİRİŞ / ÇIKIŞ
+// ══════════════════════════════════════════════
+window.girisBtnClick = async () => {
+  if (DEMO_MODE) { girisYapildi(); return; }
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPass').value;
+  const errEl = document.getElementById('loginErr');
+  errEl.textContent = '';
+  document.getElementById('loginBtn').disabled = true;
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    errEl.textContent = 'E-posta veya şifre hatalı.';
+    document.getElementById('loginBtn').disabled = false;
+  }
+};
+
+window.cikisYap = async () => {
+  if (!DEMO_MODE) await signOut(auth);
+  currentUser = null;
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  DATA = {};
+  loginEkraniGoster();
+};
+
+function loginEkraniGoster() {
+  document.getElementById('loginScreen').style.display = 'flex';
+  document.getElementById('appShell').style.display = 'none';
+}
+
+function girisYapildi() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appShell').style.display = 'block';
+  document.getElementById('userLabel').textContent = currentUser.ad;
+  document.getElementById('userRol').textContent =
+    currentUser.rol === 'admin' ? '👑 Yönetici' : '📦 Depo Sorumlusu';
+
+  // Depo kullanıcısıysa formu kilitli aç
+  if (currentUser.rol === 'depo' && currentUser.depo) {
+    const sel = document.getElementById('f_depo');
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value.startsWith(currentUser.depo)) {
+        sel.value = sel.options[i].value;
+        sel.disabled = true;
+        break;
+      }
+    }
+  }
+
+  // Admin değilse bazı menüleri gizle
+  if (currentUser.rol !== 'admin') {
+    document.getElementById('navSiralama').style.display = 'none';
+    document.getElementById('navRapor').style.display = 'none';
+  }
+
+  // Depo listesini Firebase'den yükle
+  depoListeFirebaseYukle();
+
+  // Firebase dinle
+  if (!DEMO_MODE) {
+    const dataRef = ref(db, 'kayitlar');
+    unsubscribe = onValue(dataRef, snap => {
+      DATA = snap.val() || {};
+      // Depo kullanıcısı sadece kendi verisini görür
+      if (currentUser.rol === 'depo' && currentUser.depo) {
+        Object.keys(DATA).forEach(k => {
+          if (!DATA[k].depo.startsWith(currentUser.depo)) delete DATA[k];
+        });
+      }
+      sayfaYenile();
+    });
+
+    // Depo listesi — herkes aynı listeyi görsün diye Firebase'den dinlenir
+    const depoListeRef = ref(db, 'ayarlar/depo_liste');
+    unsubscribeDepoListe = onValue(depoListeRef, snap => {
+      const val = snap.val();
+      DEPO_LISTE = val ? val : DEPO_VARSAYILAN;
+      depoSelectGuncelle();
+      if (document.getElementById('pg-admin')?.classList.contains('active')) {
+        window.adminSayfasiYukle && window.adminSayfasiYukle();
+      }
+      if (typeof sayfaYenile === 'function') sayfaYenile();
+    });
+
+    // Sistem ayarları — herkes aynı tarifeleri görsün diye Firebase'den dinlenir
+    const sistemAyarRef = ref(db, 'ayarlar/sistem');
+    unsubscribeSistemAyar = onValue(sistemAyarRef, snap => {
+      const val = snap.val();
+      SISTEM_AYAR = val ? val : SISTEM_DEFAULT;
+      if (document.getElementById('pg-admin')?.classList.contains('active')) {
+        window.adminSayfasiYukle && window.adminSayfasiYukle();
+      }
+    });
+  } else {
+    // Demo'da örnek veri yükle
+    yukleDemoData();
+  }
+
+  goPage('pg-giris', document.querySelector('.nav-tab'));
+}
+
+// ══════════════════════════════════════════════
+// VERİ KATMANI
+// ══════════════════════════════════════════════
+window.veriKaydet = async () => {
+  const depo    = document.getElementById('f_depo').value;
+  const donem   = document.getElementById('f_donem').value;
+  const doluluk = parseFloat(document.getElementById('f_doluluk').value);
+  const alan    = parseFloat(document.getElementById('f_alan').value);
+  const palet   = parseInt(document.getElementById('f_palet').value);
+  const elektrik= parseFloat(document.getElementById('f_elektrik').value);
+  const su      = parseFloat(document.getElementById('f_su').value);
+  const gaz     = parseFloat(document.getElementById('f_gaz').value);
+  const not_    = document.getElementById('f_not').value;
+
+  if (!depo)   { showToast('Depo seçiniz','err'); return; }
+  if (!donem)  { showToast('Dönem seçiniz','err'); return; }
+  if (isNaN(doluluk)||doluluk<0||doluluk>100) { showToast('Doluluk 0-100 arası olmalı','err'); return; }
+  if (isNaN(alan)||alan<=0)      { showToast('Geçerli alan giriniz','err'); return; }
+  if (isNaN(palet)||palet<0)     { showToast('Geçerli palet giriniz','err'); return; }
+  if (isNaN(elektrik)||elektrik<0){ showToast('Geçerli elektrik giriniz','err'); return; }
+  if (isNaN(su)||su<0)           { showToast('Geçerli su giriniz','err'); return; }
+  if (isNaN(gaz)||gaz<0)         { showToast('Geçerli gaz giriniz','err'); return; }
+
+  const depoKodu = depo.split(' · ')[0];
+  const row = {
+    depo: depoKodu, depoTam: depo, donem, doluluk, alan, palet,
+    elektrik, su, gaz, not: not_,
+    giren: currentUser.ad,
+    girenEmail: currentUser.email,
+    girisTarihi: new Date().toISOString()
+  };
+  hesaplaRow(row);
+
+  if (DEMO_MODE) {
+    // Mevcut kaydı güncelle
+    const editKey = document.getElementById('kaydetBtn')?.dataset?.editKey;
+    const mevcutKey = editKey || Object.keys(DATA).find(k => DATA[k].depo===depoKodu && DATA[k].donem===donem);
+    const key = mevcutKey || ('demo_' + Date.now());
+    DATA[key] = { ...row, id: key };
+    yenileSkorlar(donem);
+    sayfaYenile();
+    showToast((editKey ? 'Güncellendi' : 'Kaydedildi') + ' — ' + depoKodu);
+  } else {
+    // Firebase: mevcut kaydı bul veya yenisini oluştur
+    const tümRows = Object.entries(DATA);
+    const mevcut  = tümRows.find(([k,v]) => v.depo===depoKodu && v.donem===donem);
+    try {
+      setBtnLoading(true);
+      if (mevcut) {
+        await update(ref(db, 'kayitlar/' + mevcut[0]), row);
+        showToast('Güncellendi — ' + depoKodu + ' ' + ayLabel(donem));
+      } else {
+        await push(ref(db, 'kayitlar'), row);
+        showToast('Kaydedildi — ' + depoKodu + ' ' + ayLabel(donem));
+      }
+    } catch(e) {
+      showToast('Hata: ' + e.message, 'err');
+    } finally {
+      setBtnLoading(false);
+    }
+  }
+  formTemizle();
+};
+
+window.satirSil = async (key) => {
+  if (!confirm('Bu kaydı silmek istediğinizden emin misiniz?')) return;
+  if (DEMO_MODE) { delete DATA[key]; sayfaYenile(); showToast('Silindi'); return; }
+  try { await remove(ref(db, 'kayitlar/' + key)); showToast('Silindi'); }
+  catch(e) { showToast('Silinemedi: ' + e.message, 'err'); }
+};
+
+function setBtnLoading(v) {
+  const btn = document.getElementById('kaydetBtn');
+  btn.disabled = v;
+  btn.textContent = v ? '⏳ Kaydediliyor...' : '💾 Kaydet & Analiz Et';
+}
+
+// ══════════════════════════════════════════════
+// HESAPLAMALAR
+// ══════════════════════════════════════════════
+function hesaplaRow(r) {
+  r.kwh_m2  = r.alan  > 0 ? r.elektrik / r.alan  : 0;
+  r.kwh_pal = r.palet > 0 ? r.elektrik / r.palet : 0;
+  r.su_m2   = r.alan  > 0 ? r.su       / r.alan  : 0;
+  r.gaz_m2  = r.alan  > 0 ? r.gaz      / r.alan  : 0;
+  return r;
+}
+
+function verimlilikSkoru(row, donemRows) {
+  if (!donemRows.length) return 50;
+  const kwh_vals   = donemRows.map(r=>r.kwh_m2).filter(v=>v>0);
+  const water_vals = donemRows.map(r=>r.su_m2).filter(v=>v>0);
+  const gas_vals   = donemRows.map(r=>r.gaz_m2).filter(v=>v>0);
+  const max_kwh   = Math.max(...kwh_vals)||1, min_kwh = Math.min(...kwh_vals)||0;
+  const max_water = Math.max(...water_vals)||1;
+  const max_gas   = Math.max(...gas_vals)||1;
+  const n_kwh   = 1 - ((row.kwh_m2 - min_kwh)/(max_kwh - min_kwh||1));
+  const n_water = 1 - (row.su_m2  / max_water);
+  const n_gas   = 1 - (row.gaz_m2 / max_gas);
+  const n_occ   = row.doluluk / 100;
+  return Math.round((n_kwh*0.4 + n_water*0.15 + n_gas*0.15 + n_occ*0.3)*100);
+}
+
+function yenileSkoru(donem) {
+  const donemRows = Object.values(DATA).filter(r=>r.donem===donem);
+  donemRows.forEach(r => { r.skor = verimlilikSkoru(r, donemRows); });
+}
+
+function yenileAllSkorlar() {
+  const donemler = [...new Set(Object.values(DATA).map(r=>r.donem))];
+  donemler.forEach(d => yenileSkoru(d));
+}
+
+function yenileSkoru_alias(d) { yenileSkoru(d); } // alias
+function yenileSkoru_alias2(d) { yenileSkoru(d); }
+
+// ── aktif dönem (en son) ──
+let aktifDonem = '';
+
+function sonDonem() {
+  const donemler = [...new Set(Object.values(DATA).map(r=>r.donem))].sort();
+  return donemler.length ? donemler[donemler.length-1] : '';
+}
+
+function sayfaYenile() {
+  yenileAllSkorlar();
+  if (!aktifDonem) aktifDonem = sonDonem();
+  sayacGuncelle();
+  tabloGoster();
+  if (document.getElementById('pg-analiz').classList.contains('active')) analizSayfasiYukle();
+  if (document.getElementById('pg-uyarilar').classList.contains('active')) uyarilariHesapla();
+  if (document.getElementById('pg-karsilastirma').classList.contains('active')) siralamaSayfasiYukle();
+  if (document.getElementById('pg-rapor').classList.contains('active')) raporAylariniDoldur();
+  onlineKullaniciGuncelle();
+}
+
+// ══════════════════════════════════════════════
+// DEMO VERİ
+// ══════════════════════════════════════════════
+function yukleDemoData() {
+  const demoRows = [
+    {depo:'D-01',depoTam:'D-01 · İstanbul Anadolu',donem:'2024-10',doluluk:85,alan:5200,palet:2100,elektrik:10400,su:208,gaz:624,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-02',depoTam:'D-02 · İstanbul Avrupa', donem:'2024-10',doluluk:72,alan:4800,palet:1750,elektrik:14400,su:240,gaz:720,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-03',depoTam:'D-03 · Ankara Merkez',   donem:'2024-10',doluluk:60,alan:3900,palet:1200,elektrik:15210,su:312,gaz:936,not:'Kompresör bakımı',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-04',depoTam:'D-04 · İzmir Liman',     donem:'2024-10',doluluk:91,alan:6100,palet:2500,elektrik:10980,su:183,gaz:549,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-05',depoTam:'D-05 · Bursa Sanayi',    donem:'2024-10',doluluk:68,alan:4200,palet:1450,elektrik:16380,su:336,gaz:1008,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-01',depoTam:'D-01 · İstanbul Anadolu',donem:'2024-09',doluluk:82,alan:5200,palet:2000,elektrik:10920,su:214,gaz:642,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-02',depoTam:'D-02 · İstanbul Avrupa', donem:'2024-09',doluluk:75,alan:4800,palet:1800,elektrik:13440,su:230,gaz:690,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+    {depo:'D-04',depoTam:'D-04 · İzmir Liman',     donem:'2024-09',doluluk:88,alan:6100,palet:2400,elektrik:11590,su:190,gaz:570,not:'',giren:'Demo',girenEmail:'demo@demo.com',girisTarihi:new Date().toISOString()},
+  ];
+  demoRows.forEach((r,i) => {
+    hesaplaRow(r);
+    DATA['demo_'+i] = { ...r, id: 'demo_'+i };
+  });
+  yenileAllSkorlar();
+  aktifDonem = '2024-10';
+  sayfaYenile();
+}
+
+// ══════════════════════════════════════════════
+// UI YARDIMCILARI
+// ══════════════════════════════════════════════
+const AYLAR_TR = ['Oca','Şub','Mar','Nis','May','Haz','Tem','Ağu','Eyl','Eki','Kas','Ara'];
+function ayLabel(yyyymm) {
+  if (!yyyymm) return '—';
+  const [y,m] = yyyymm.split('-');
+  return AYLAR_TR[parseInt(m)-1] + ' ' + y;
+}
+function sayi(v, d=2) {
+  if (v===null||v===undefined||isNaN(v)) return '—';
+  return parseFloat(v).toFixed(d);
+}
+function skorRenk(s) {
+  if (s>=75) return {bg:'#d1fae5',color:'#059669',label:'İyi'};
+  if (s>=50) return {bg:'#fef3c7',color:'#d97706',label:'Orta'};
+  return {bg:'#fef2f2',color:'#dc2626',label:'Müdahale'};
+}
+function donemOncesi(yyyymm) {
+  const [y,m] = yyyymm.split('-').map(Number);
+  return m===1 ? (y-1)+'-12' : y+'-'+String(m-1).padStart(2,'0');
+}
+function showToast(msg, type='ok') {
+  const t = document.getElementById('toast');
+  t.innerHTML = (type==='ok'?'✅ ':'❌ ') + msg;
+  t.style.background = type==='ok' ? '#1a1d23' : '#dc2626';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 3000);
+}
+
+window.goPage = (id, el) => {
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if (el) el.classList.add('active');
+  if (id==='pg-analiz')        analizSayfasiYukle();
+  if (id==='pg-uyarilar')      uyarilariHesapla();
+  if (id==='pg-karsilastirma') siralamaSayfasiYukle();
+  if (id==='pg-rapor')         raporAylariniDoldur();
+  if (id==='pg-admin')         setTimeout(() => { if(window.adminSayfasiYukle) window.adminSayfasiYukle(); }, 80);
+};
+
+// ── SATIR DÜZENLE ──────────────────────────────────────────
+window.satirDuzenle = (key) => {
+  const r = DATA[key];
+  if (!r) return;
+
+  // Formu doldur
+  const depoSel = document.getElementById('f_depo');
+  // Depo select'te eşleşen option'ı bul
+  for (let i = 0; i < depoSel.options.length; i++) {
+    if (depoSel.options[i].value.startsWith(r.depo + ' ·')) {
+      depoSel.value = depoSel.options[i].value;
+      break;
+    }
+  }
+  // Eğer hâlâ seçilemediyse doğrudan value ata
+  if (!depoSel.value || !depoSel.value.startsWith(r.depo)) {
+    // Geçici option ekle
+    const opt = document.createElement('option');
+    opt.value = r.depo + ' · ' + (r.depoTam?.split(' · ')[1] || r.depo);
+    opt.textContent = opt.value;
+    depoSel.appendChild(opt);
+    depoSel.value = opt.value;
+  }
+  if (currentUser?.rol === 'depo') depoSel.disabled = true;
+
+  document.getElementById('f_donem').value    = r.donem;
+  document.getElementById('f_doluluk').value  = r.doluluk;
+  document.getElementById('f_alan').value     = r.alan;
+  document.getElementById('f_palet').value    = r.palet;
+  document.getElementById('f_elektrik').value = r.elektrik;
+  document.getElementById('f_su').value       = r.su;
+  document.getElementById('f_gaz').value      = r.gaz;
+  document.getElementById('f_not').value      = r.not || '';
+
+  // Düzenleme modunu işaretle
+  document.getElementById('kaydetBtn').textContent = '💾 Güncelle';
+  document.getElementById('kaydetBtn').style.background = '#d97706';
+
+  // İptal butonu göster
+  let iptalBtn = document.getElementById('iptalBtn');
+  if (!iptalBtn) {
+    iptalBtn = document.createElement('button');
+    iptalBtn.id = 'iptalBtn';
+    iptalBtn.className = 'btn btn-secondary';
+    iptalBtn.textContent = '✕ İptal';
+    iptalBtn.onclick = formTemizle;
+    document.getElementById('kaydetBtn').parentElement.insertBefore(iptalBtn, document.getElementById('kaydetBtn'));
+  }
+  iptalBtn.style.display = '';
+
+  // Düzenlenen kaydın key'ini sakla
+  document.getElementById('kaydetBtn').dataset.editKey = key;
+
+  // Forma kaydır
+  document.getElementById('f_depo').scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+  // Banner göster
+  let banner = document.getElementById('duzenleBanner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'duzenleBanner';
+    banner.style.cssText = 'background:#fffbeb;border:1.5px solid #fde68a;border-radius:8px;padding:10px 14px;font-size:12.5px;color:#92400e;display:flex;align-items:center;gap:8px;margin-bottom:14px;';
+    const form = document.querySelector('#pg-giris .card');
+    form.parentElement.insertBefore(banner, form);
+  }
+  banner.innerHTML = `✏️ <strong>${r.depo} — ${ayLabel(r.donem)}</strong> kaydını düzenliyorsunuz. Değişiklikleri yapıp "Güncelle" butonuna basın.`;
+  banner.style.display = 'flex';
+
+  onizlemeGuncelle();
+};
+
+window.formTemizle = () => {
+  ['f_doluluk','f_alan','f_palet','f_elektrik','f_su','f_gaz','f_not'].forEach(id=>{
+    document.getElementById(id).value='';
+  });
+  if (currentUser?.rol !== 'depo') document.getElementById('f_depo').value='';
+  document.getElementById('onizleme').style.display='none';
+
+  // Düzenleme modunu sıfırla
+  const kaydetBtn = document.getElementById('kaydetBtn');
+  if (kaydetBtn) {
+    kaydetBtn.textContent = '💾 Kaydet & Analiz Et';
+    kaydetBtn.style.background = '';
+    delete kaydetBtn.dataset.editKey;
+  }
+  const iptalBtn = document.getElementById('iptalBtn');
+  if (iptalBtn) iptalBtn.style.display = 'none';
+  const banner = document.getElementById('duzenleBanner');
+  if (banner) banner.style.display = 'none';
+};
+
+function sayacGuncelle() {
+  const n = Object.keys(DATA).length;
+  document.getElementById('kayitSayisi').textContent = n + ' kayıt';
+  const uw = hesaplaUyariSayisi();
+  const badge = document.getElementById('alertCount');
+  badge.style.display = uw>0 ? 'inline':'none';
+  badge.textContent = uw;
+}
+function hesaplaUyariSayisi() {
+  const th = parseFloat(document.getElementById('th_kwh')?.value||4);
+  const to = parseFloat(document.getElementById('th_doluluk')?.value||60);
+  return Object.values(DATA).filter(r=>r.kwh_m2>th||r.doluluk<to).length;
+}
+
+function onlineKullaniciGuncelle() {
+  // Firebase Presence ile gerçek online kullanıcı sayısı gösterilebilir
+  // Demo'da sabit göster
+  const unique = [...new Set(Object.values(DATA).map(r=>r.girenEmail))].length;
+  document.getElementById('aktifKullanici').textContent = unique + ' kullanıcı veri girmiş';
+}
+
+// ══════════════════════════════════════════════
+// VERİ GİRİŞİ TABLOSU
+// ══════════════════════════════════════════════
+function tabloGoster() {
+  const filtre = document.getElementById('filterDonem').value;
+  const rows = Object.entries(DATA)
+    .filter(([k,r]) => !filtre || r.donem===filtre)
+    .sort(([,a],[,b]) => b.donem.localeCompare(a.donem)||a.depo.localeCompare(b.depo));
+
+  const tbody = document.getElementById('veriTbody');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="13"><div class="empty"><div class="empty-icon">📋</div>
+      <div class="empty-title">Veri bulunamadı</div>
+      <div class="empty-sub">Bu döneme ait kayıt yok veya henüz girilmedi.</div></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(([key,r]) => {
+    const sk = skorRenk(r.skor||50);
+    const silBtn = (currentUser?.rol==='admin' || currentUser?.email===r.girenEmail)
+      ? `<button class="btn btn-danger btn-sm" onclick="satirSil('${key}')">✕</button>` : '';
+    return `<tr>
+      <td><strong>${r.depo}</strong></td>
+      <td>${ayLabel(r.donem)}</td>
+      <td class="td-mono">${r.doluluk}%</td>
+      <td class="td-mono">${(r.alan||0).toLocaleString()}</td>
+      <td class="td-mono">${(r.palet||0).toLocaleString()}</td>
+      <td class="td-mono">${(r.elektrik||0).toLocaleString()}</td>
+      <td class="td-mono">${sayi(r.kwh_m2)}</td>
+      <td>
+        <div class="score-bar-wrap">
+          <div class="score-bar-track"><div class="score-bar-fill" style="width:${r.skor||0}%;background:${sk.color}"></div></div>
+          <div class="score-num" style="color:${sk.color}">${r.skor||'—'}</div>
+        </div>
+      </td>
+      <td><span class="badge" style="background:${sk.bg};color:${sk.color}">${sk.label}</span></td>
+      <td class="td-mini text-muted">${r.giren||'—'}</td>
+      <td class="td-mini text-muted">${r.girisTarihi ? new Date(r.girisTarihi).toLocaleDateString('tr-TR') : '—'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-secondary btn-sm" onclick="satirDuzenle('${key}')" style="margin-right:4px">✏️ Düzenle</button>
+        ${silBtn}
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// Anlık önizleme
+function onizlemeGuncelle() {
+  const e = parseFloat(document.getElementById('f_elektrik').value);
+  const a = parseFloat(document.getElementById('f_alan').value);
+  const p = parseInt(document.getElementById('f_palet').value);
+  const s = parseFloat(document.getElementById('f_su').value);
+  const g = parseFloat(document.getElementById('f_gaz').value);
+  const d = parseFloat(document.getElementById('f_doluluk').value);
+  if (isNaN(e)||isNaN(a)||a<=0) { document.getElementById('onizleme').style.display='none'; return; }
+  const kwh_m2 = e/a, kwh_pal=(!isNaN(p)&&p>0)?e/p:0, su_m2=(!isNaN(s)&&s>0)?s/a:0, gaz_m2=(!isNaN(g)&&g>0)?g/a:0;
+  document.getElementById('onizleme').style.display='block';
+  document.getElementById('onizlemeKpiRow').innerHTML = `
+    <div class="kpi-card"><div class="kpi-lbl">kWh/m²</div>
+      <div class="kpi-val" style="color:${kwh_m2>4?'#dc2626':kwh_m2<2.5?'#059669':'#d97706'}">${sayi(kwh_m2)}</div>
+      <div class="kpi-delta" style="color:${kwh_m2>4?'#dc2626':kwh_m2<2.5?'#059669':'#d97706'}">${kwh_m2>4?'⚠️ Yüksek':kwh_m2<2.5?'✅ İyi':'Orta seviye'}</div></div>
+    <div class="kpi-card"><div class="kpi-lbl">kWh/Palet</div><div class="kpi-val">${kwh_pal>0?sayi(kwh_pal):'—'}</div></div>
+    <div class="kpi-card"><div class="kpi-lbl">Su/m²</div><div class="kpi-val">${su_m2>0?sayi(su_m2,4):'—'}</div></div>
+    <div class="kpi-card"><div class="kpi-lbl">Gaz/m²</div><div class="kpi-val">${gaz_m2>0?sayi(gaz_m2,4):'—'}</div></div>
+    <div class="kpi-card" style="${!isNaN(d)?`background:${d<60?'#fef2f2':d>80?'#ecfdf5':'#fffbeb'}`:''}">
+      <div class="kpi-lbl">Doluluk</div><div class="kpi-val">${!isNaN(d)?d+'%':'—'}</div></div>`;
+  const uw = document.getElementById('onizlemeUyari');
+  const uyarilar = [];
+  if (kwh_m2>4) uyarilar.push('⚡ kWh/m² yüksek — sayaç değerini kontrol edin');
+  if (!isNaN(d)&&d<60) uyarilar.push('📦 Doluluk %60 altı — konsolidasyon değerlendirin');
+  uw.innerHTML = uyarilar.map(u=>`<div class="alert alert-amber"><div class="alert-icon">⚠️</div><div class="alert-body">${u}</div></div>`).join('');
+}
+
+// ══════════════════════════════════════════════
+// ANALİZ SAYFASI
+// ══════════════════════════════════════════════
+function analizSayfasiYukle() {
+  const rows = Object.values(DATA).filter(r=>r.donem===aktifDonem);
+  document.getElementById('analizAyLabel').textContent = ayLabel(aktifDonem);
+
+  if (rows.length) {
+    const avg = fn => rows.reduce((s,r)=>s+(r[fn]||0),0)/rows.length;
+    document.getElementById('ak1').innerHTML = sayi(avg('kwh_m2'))+'<span class="kpi-unit"> kWh</span>';
+    document.getElementById('ak2').innerHTML = sayi(avg('kwh_pal'))+'<span class="kpi-unit"> kWh</span>';
+    document.getElementById('ak3').innerHTML = sayi(avg('su_m2'),4)+'<span class="kpi-unit"> m³</span>';
+    document.getElementById('ak4').innerHTML = sayi(avg('gaz_m2'),4)+'<span class="kpi-unit"> m³</span>';
+    document.getElementById('ak5').innerHTML = sayi(avg('doluluk'),1)+'<span class="kpi-unit">%</span>';
+  }
+  document.getElementById('ak6').textContent = rows.length;
+
+  if (rows.length) {
+    const sorted = [...rows].sort((a,b)=>b.skor-a.skor);
+    document.getElementById('skorListesi').innerHTML = sorted.map((r,i)=>{
+      const sk=skorRenk(r.skor);
+      return `<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);${i===sorted.length-1?'border:none':''}">
+        <span style="width:20px;font-size:12px;font-weight:700;color:var(--ink3)">${i+1}</span>
+        <span style="flex:1;font-size:13px;font-weight:600">${r.depo}</span>
+        <div style="width:90px;height:8px;background:var(--bg2);border-radius:4px;overflow:hidden">
+          <div style="width:${r.skor}%;height:100%;background:${sk.color};border-radius:4px"></div>
+        </div>
+        <span style="font-size:13px;font-weight:700;color:${sk.color};width:28px;text-align:right">${r.skor}</span>
+      </div>`;
+    }).join('');
+
+    const sortedKwh = [...rows].sort((a,b)=>a.kwh_m2-b.kwh_m2);
+    const maxKwh = Math.max(...sortedKwh.map(r=>r.kwh_m2));
+    document.getElementById('kwhBarListesi').innerHTML = sortedKwh.map(r=>{
+      const pct=(r.kwh_m2/maxKwh)*100;
+      const c=r.kwh_m2<2.5?'#059669':r.kwh_m2<4?'#d97706':'#dc2626';
+      return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">
+        <span style="font-size:11px;font-weight:600;width:36px;color:var(--ink2)">${r.depo}</span>
+        <div style="flex:1;height:9px;background:var(--bg2);border-radius:5px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:${c};border-radius:5px"></div>
+        </div>
+        <span style="font-size:11px;font-family:monospace;color:${c};font-weight:700;width:36px">${sayi(r.kwh_m2)}</span>
+      </div>`;
+    }).join('');
+
+    const tbody = document.getElementById('analizTbody');
+    tbody.innerHTML = sorted.map(r=>{
+      const sk=skorRenk(r.skor);
+      return `<tr>
+        <td><strong>${r.depo}</strong></td>
+        <td class="td-mono">${r.doluluk}%</td>
+        <td class="td-mono" style="color:${r.kwh_m2>4?'#dc2626':r.kwh_m2<2.5?'#059669':'inherit'};font-weight:${r.kwh_m2>4||r.kwh_m2<2.5?700:400}">${sayi(r.kwh_m2)}</td>
+        <td class="td-mono">${sayi(r.kwh_pal)}</td>
+        <td class="td-mono">${sayi(r.su_m2,4)}</td>
+        <td class="td-mono">${sayi(r.gaz_m2,4)}</td>
+        <td><div class="score-bar-wrap">
+          <div class="score-bar-track"><div class="score-bar-fill" style="width:${r.skor}%;background:${sk.color}"></div></div>
+          <div class="score-num" style="color:${sk.color}">${r.skor}</div></div></td>
+        <td><span class="badge" style="background:${sk.bg};color:${sk.color}">${sk.label}</span></td>
+        <td class="td-mini text-muted">${r.giren||'—'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Isı haritası
+  const tümDonemler = [...new Set(Object.values(DATA).map(r=>r.donem))].sort().slice(-6);
+  const tümDepolar  = [...new Set(Object.values(DATA).map(r=>r.depo))].sort();
+  if (tümDonemler.length && tümDepolar.length) {
+    let html = `<div style="display:grid;grid-template-columns:48px repeat(${tümDonemler.length},1fr);gap:3px;">`;
+    html += '<div></div>' + tümDonemler.map(d=>`<div style="font-size:10px;font-weight:700;color:var(--ink3);text-align:center;padding:2px">${ayLabel(d).split(' ')[0]}</div>`).join('');
+    tümDepolar.forEach(dep=>{
+      html+=`<div style="font-size:11px;font-weight:600;color:var(--ink2);display:flex;align-items:center">${dep}</div>`;
+      tümDonemler.forEach(d=>{
+        const r=Object.values(DATA).find(x=>x.depo===dep&&x.donem===d);
+        if(!r){html+='<div style="background:var(--bg2);border-radius:4px;padding:5px 2px;text-align:center;font-size:10px;color:var(--ink4)">—</div>';return;}
+        const cls=r.kwh_m2<2?'hm-1':r.kwh_m2<2.8?'hm-2':r.kwh_m2<3.5?'hm-3':r.kwh_m2<4?'hm-4':r.kwh_m2<5?'hm-5':'hm-6';
+        html+=`<div class="hm-cell ${cls}" title="${dep} ${ayLabel(d)}: ${sayi(r.kwh_m2)}">${sayi(r.kwh_m2,1)}</div>`;
+      });
+    });
+    html+='</div>';
+    document.getElementById('heatmapGrid').innerHTML=html;
+  }
+}
+
+window.analizAyDegistir = (d) => {
+  const donemler=[...new Set(Object.values(DATA).map(r=>r.donem))].sort();
+  if(!donemler.length)return;
+  const idx=donemler.indexOf(aktifDonem);
+  const ni=Math.max(0,Math.min(donemler.length-1,(idx===-1?donemler.length-1:idx)+d));
+  aktifDonem=donemler[ni];
+  analizSayfasiYukle();
+};
+
+// ══════════════════════════════════════════════
+// UYARILAR
+// ══════════════════════════════════════════════
+window.uyarilariHesapla = () => {
+  const kwh_th=parseFloat(document.getElementById('th_kwh')?.value||4);
+  const occ_th=parseFloat(document.getElementById('th_doluluk')?.value||60);
+  const mom_th=parseFloat(document.getElementById('th_mom')?.value||25);
+  const uyarilar=[];
+  Object.values(DATA).forEach(r=>{
+    if(r.kwh_m2>kwh_th) uyarilar.push({tip:'red',icon:'⚡',
+      baslik:`${r.depo} — Yüksek Enerji: ${ayLabel(r.donem)}`,
+      aciklama:`kWh/m² = ${sayi(r.kwh_m2)} (eşik: ${kwh_th}). Ekipman ve sayaç kontrolü gerekli.`,
+      giren:r.giren});
+    if(r.doluluk<occ_th) uyarilar.push({tip:'amber',icon:'📦',
+      baslik:`${r.depo} — Düşük Doluluk: ${ayLabel(r.donem)}`,
+      aciklama:`Doluluk %${r.doluluk} (min: %${occ_th}). Konsolidasyon değerlendirin.`,
+      giren:r.giren});
+    const prev=Object.values(DATA).find(x=>x.depo===r.depo&&x.donem===donemOncesi(r.donem));
+    if(prev&&prev.kwh_m2>0){
+      const chg=((r.kwh_m2-prev.kwh_m2)/prev.kwh_m2)*100;
+      if(chg>mom_th) uyarilar.push({tip:'red',icon:'📈',
+        baslik:`${r.depo} — Ani Artış: ${ayLabel(r.donem)}`,
+        aciklama:`kWh/m² bir önceki aya göre +%${sayi(chg,1)} arttı.`,
+        giren:r.giren});
+    }
+  });
+  sayacGuncelle();
+  const el=document.getElementById('uyariListesi');
+  if(!uyarilar.length){
+    el.innerHTML='<div class="empty"><div class="empty-icon">✅</div><div class="empty-title">Uyarı yok</div><div class="empty-sub">Tüm değerler eşik sınırları içinde</div></div>';
+    return;
+  }
+  el.innerHTML=[...uyarilar].sort((a,b)=>a.tip==='red'&&b.tip!=='red'?-1:1).map(u=>`
+    <div class="alert alert-${u.tip==='red'?'red':'amber'}" style="margin-bottom:8px;">
+      <div class="alert-icon">${u.icon}</div>
+      <div style="flex:1"><div class="alert-title">${u.baslik}</div>
+      <div class="alert-body">${u.aciklama}</div></div>
+      <div style="font-size:10px;color:var(--ink3);white-space:nowrap;align-self:center">📝 ${u.giren||'—'}</div>
+    </div>`).join('');
+};
+
+// ══════════════════════════════════════════════
+// SIRALAMA
+// ══════════════════════════════════════════════
+function siralamaSayfasiYukle() {
+  const sd=sonDonem();
+  if(!sd)return;
+  const rows=Object.values(DATA).filter(r=>r.donem===sd).sort((a,b)=>b.skor-a.skor);
+  if(!rows.length)return;
+  const best3=rows.slice(0,3), worst3=rows.slice(-3).reverse();
+  document.getElementById('enIyi3').innerHTML=best3.map((r,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid rgba(5,150,105,.15);${i===2?'border:none':''}">
+      <span style="font-size:18px">${['🥇','🥈','🥉'][i]}</span>
+      <div style="flex:1"><div style="font-weight:700">${r.depo} <span style="font-weight:400;color:var(--ink3);font-size:12px">${r.depoTam?.split(' · ')[1]||''}</span></div>
+      <div style="font-size:11px;color:var(--ink3)">kWh/m²: ${sayi(r.kwh_m2)} · %${r.doluluk} doluluk</div></div>
+      <span style="font-size:20px;font-weight:700;color:#059669">${r.skor}</span>
+    </div>`).join('');
+  document.getElementById('enKotu3').innerHTML=worst3.map((r,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid rgba(220,38,38,.15);${i===2?'border:none':''}">
+      <span style="font-size:18px">${['🔴','🟠','🟡'][i]}</span>
+      <div style="flex:1"><div style="font-weight:700">${r.depo} <span style="font-weight:400;color:var(--ink3);font-size:12px">${r.depoTam?.split(' · ')[1]||''}</span></div>
+      <div style="font-size:11px;color:var(--ink3)">kWh/m²: ${sayi(r.kwh_m2)} · %${r.doluluk} doluluk</div></div>
+      <span style="font-size:20px;font-weight:700;color:#dc2626">${r.skor}</span>
+    </div>`).join('');
+  document.getElementById('tamSiralama').innerHTML=rows.map((r,i)=>{
+    const sk=skorRenk(r.skor);
+    return `<div style="display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:var(--r);margin-bottom:6px;background:${sk.bg};border:1px solid ${sk.color}22;">
+      <span style="font-size:13px;font-weight:700;color:var(--ink3);width:22px">${i+1}</span>
+      <div style="flex:1">
+        <div style="font-weight:700;font-size:13px">${r.depo} <span style="font-weight:400;color:var(--ink3)">${r.depoTam?.split(' · ')[1]||''}</span></div>
+        <div style="font-size:11px;color:var(--ink3);margin-top:2px">kWh/m²: ${sayi(r.kwh_m2)} · %${r.doluluk} · ${ayLabel(r.donem)} · 📝 ${r.giren||'—'}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:20px;font-weight:700;color:${sk.color}">${r.skor}</div>
+        <span class="badge" style="background:white;color:${sk.color};border:1px solid ${sk.color}44">${sk.label}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ══════════════════════════════════════════════
+// RAPOR
+// ══════════════════════════════════════════════
+function raporAylariniDoldur() {
+  const donemler=[...new Set(Object.values(DATA).map(r=>r.donem))].sort().reverse();
+  const sel=document.getElementById('raporAy');
+  sel.innerHTML='<option value="">— Ay seçin —</option>'+donemler.map(d=>`<option value="${d}">${ayLabel(d)}</option>`).join('');
+}
+window.raporOlustur = () => {
+  const donem=document.getElementById('raporAy').value;
+  const el=document.getElementById('reportPreview');
+  if(!donem){el.innerHTML='<div class="empty"><div class="empty-icon">📄</div><div class="empty-sub">Ay seçin</div></div>';return;}
+  const rows=Object.values(DATA).filter(r=>r.donem===donem).sort((a,b)=>b.skor-a.skor);
+  if(!rows.length){el.innerHTML='<div class="empty"><div class="empty-icon">📭</div><div class="empty-sub">Bu dönem için veri yok</div></div>';return;}
+  const avg=fn=>rows.reduce((s,r)=>s+(r[fn]||0),0)/rows.length;
+  const best=rows[0], worst=rows[rows.length-1];
+  const th=parseFloat(document.getElementById('th_kwh')?.value||4);
+  const uyariSayisi=rows.filter(r=>r.kwh_m2>th).length;
+  const girecepler=[...new Set(rows.map(r=>r.giren))];
+  el.innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:18px;border-bottom:2px solid #1a1d23;margin-bottom:20px;">
+      <div><div style="font-size:22px;font-weight:700">Enerji Verimlilik Raporu</div>
+      <div style="font-size:12px;color:#6b7280;margin-top:3px">${ayLabel(donem)} · ${rows.length} Depo · ${girecepler.join(', ')} tarafından girildi</div></div>
+      <div style="font-size:28px">📦</div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px;">
+      ${[['Ort. kWh/m²',sayi(avg('kwh_m2')),avg('kwh_m2')>4?'#dc2626':avg('kwh_m2')<2.5?'#059669':'#d97706'],
+         ['Ort. Doluluk','%'+sayi(avg('doluluk'),1),'#1a1d23'],
+         ['Giren Depo',rows.length+' / 15','#2563eb'],
+         ['Uyarı',uyariSayisi,uyariSayisi>0?'#dc2626':'#059669']].map(([l,v,c])=>
+        `<div style="background:#f8f9fb;border:1px solid #e2e6ed;border-radius:6px;padding:10px 12px">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-bottom:4px">${l}</div>
+          <div style="font-size:20px;font-weight:700;color:${c}">${v}</div></div>`).join('')}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px;">
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;color:#059669;text-transform:uppercase;margin-bottom:4px">🏆 En Verimli</div>
+        <div style="font-size:16px;font-weight:700">${best.depo}</div>
+        <div style="font-size:12px;color:#6b7280">Skor: ${best.skor} · kWh/m²: ${sayi(best.kwh_m2)} · Veri: ${best.giren}</div>
+      </div>
+      <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:6px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;color:#dc2626;text-transform:uppercase;margin-bottom:4px">⚠️ İyileştirme Gerekli</div>
+        <div style="font-size:16px;font-weight:700">${worst.depo}</div>
+        <div style="font-size:12px;color:#6b7280">Skor: ${worst.skor} · kWh/m²: ${sayi(worst.kwh_m2)} · Veri: ${worst.giren}</div>
+      </div>
+    </div>
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#6b7280;border-bottom:1px solid #e2e6ed;padding-bottom:5px;margin-bottom:12px">Performans Tablosu</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead><tr style="background:#f8f9fb">
+        ${['#','Depo','Doluluk','kWh/m²','kWh/Palet','Su/m²','Gaz/m²','Skor','Durum','Veri Giren'].map(h=>
+          `<th style="padding:7px 10px;text-align:left;border-bottom:1px solid #e2e6ed;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;white-space:nowrap">${h}</th>`).join('')}
+      </tr></thead>
+      <tbody>${rows.map((r,i)=>{const sk=skorRenk(r.skor);return`<tr>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-weight:700;color:#9ca3af">${i+1}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-weight:700">${r.depo}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-family:monospace">%${r.doluluk}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-family:monospace;color:${sk.color};font-weight:700">${sayi(r.kwh_m2)}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-family:monospace">${sayi(r.kwh_pal)}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-family:monospace">${sayi(r.su_m2,4)}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-family:monospace">${sayi(r.gaz_m2,4)}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-weight:700;color:${sk.color}">${r.skor}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9"><span style="background:${sk.bg};color:${sk.color};padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700">${sk.label}</span></td>
+        <td style="padding:7px 10px;border-bottom:1px solid #f4f6f9;font-size:11px;color:#6b7280">${r.giren||'—'}</td>
+      </tr>`;}).join('')}</tbody>
+    </table>
+    <div style="margin-top:24px;padding-top:12px;border-top:1px solid #e2e6ed;font-size:10px;color:#9ca3af;text-align:center">
+      Depo Enerji Takip Sistemi · ${ayLabel(donem)} · Oluşturulma: ${new Date().toLocaleDateString('tr-TR')} · Gizli — Şirket İçi
+    </div>`;
+};
+
+// Enter tuşu dinle
+document.addEventListener('keydown', e => {
+  if (e.key==='Enter' && document.getElementById('loginScreen').style.display!=='none') {
+    window.girisBtnClick();
+  }
+});
+
+// Anlık önizleme dinleyicileri (sayfa yüklendikten sonra)
+document.addEventListener('DOMContentLoaded', () => {
+  ['f_doluluk','f_alan','f_palet','f_elektrik','f_su','f_gaz'].forEach(id=>{
+    document.getElementById(id)?.addEventListener('input', onizlemeGuncelle);
+  });
+  const now=new Date();
+  const ym=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+  document.getElementById('f_donem').value=ym;
+  document.getElementById('filterDonem').value=ym;
+
+
+// ══ YÖNETİM & DEPO FONKSİYONLARI (module içine taşındı) ══
+
+// ══════════════════════════════════════════════
+// DEPO MASTER VERİSİ
+// ══════════════════════════════════════════════
+const SISTEM_DEFAULT = {
+  sirket: 'WEA', elektrik: 4.85, su: 38.50, gaz: 12.20, girisGunu: 5, filtre: 'son'
+};
+let SISTEM_AYAR = JSON.parse(localStorage.getItem('sistem_ayar') || 'null') || SISTEM_DEFAULT;
+
+// ── DEPO LİSTESİ ────────────────────────────────────────
+// Varsayılan liste — kullanıcı istediği gibi değiştirebilir
+const DEPO_VARSAYILAN = [
+  {kod:'D-01', ad:'İstanbul Anadolu', sehir:'İstanbul', tip:'Lojistik', alan:5200, aktif:true},
+  {kod:'D-02', ad:'İstanbul Avrupa',  sehir:'İstanbul', tip:'Lojistik', alan:4800, aktif:true},
+  {kod:'D-03', ad:'Ankara Merkez',    sehir:'Ankara',   tip:'Kuru',     alan:3900, aktif:true},
+  {kod:'D-04', ad:'İzmir Liman',      sehir:'İzmir',    tip:'Lojistik', alan:6100, aktif:true},
+  {kod:'D-05', ad:'Bursa Sanayi',     sehir:'Bursa',    tip:'Kuru',     alan:4200, aktif:true},
+  {kod:'D-06', ad:'Kocaeli Gebze',    sehir:'Kocaeli',  tip:'Lojistik', alan:5500, aktif:true},
+  {kod:'D-07', ad:'Adana Güney',      sehir:'Adana',    tip:'Soğuk',    alan:3200, aktif:true},
+  {kod:'D-08', ad:'Gaziantep',        sehir:'Gaziantep',tip:'Kuru',     alan:4100, aktif:true},
+  {kod:'D-09', ad:'Konya',            sehir:'Konya',    tip:'Kuru',     alan:3800, aktif:true},
+  {kod:'D-10', ad:'Mersin Liman',     sehir:'Mersin',   tip:'Lojistik', alan:5800, aktif:true},
+  {kod:'D-11', ad:'Samsun',           sehir:'Samsun',   tip:'Kuru',     alan:3400, aktif:true},
+  {kod:'D-12', ad:'Trabzon',          sehir:'Trabzon',  tip:'Soğuk',    alan:2900, aktif:true},
+  {kod:'D-13', ad:'Erzurum',          sehir:'Erzurum',  tip:'Soğuk',    alan:2600, aktif:false},
+  {kod:'D-14', ad:'Denizli',          sehir:'Denizli',  tip:'Kuru',     alan:3100, aktif:true},
+  {kod:'D-15', ad:'Malatya',          sehir:'Malatya',  tip:'Kuru',     alan:3300, aktif:true},
+];
+
+// Firebase'den yükle — herkes aynı listeyi görür
+let DEPO_LISTE = [...DEPO_VARSAYILAN]; // başlangıç değeri, Firebase gelince güncellenir
+
+function depoListeFirebaseYukle() {
+  if (DEMO_MODE) {
+    DEPO_LISTE = JSON.parse(localStorage.getItem('depo_liste') || 'null') || DEPO_VARSAYILAN;
+    depoSelectGuncelle();
+    return;
+  }
+  const depoRef = ref(db, 'ayarlar/depo_liste');
+  onValue(depoRef, snap => {
+    const val = snap.val();
+    if (val) {
+      DEPO_LISTE = val;
+    } else {
+      // Firebase'de yoksa varsayılanı bir kez yaz
+      set(depoRef, DEPO_VARSAYILAN);
+      DEPO_LISTE = [...DEPO_VARSAYILAN];
+    }
+    depoSelectGuncelle();
+    if (window.adminSayfasiYukle && document.getElementById('pg-admin')?.classList.contains('active')) {
+      window.adminSayfasiYukle();
+    }
+  });
+}
+
+function depoAd(kod) {
+  const d = DEPO_LISTE.find(x => x.kod === kod);
+  return d ? d.ad : kod;
+}
+
+// Form select'i DEPO_LISTE'den doldur
+function depoSelectGuncelle() {
+  const sel = document.getElementById('f_depo');
+  if (!sel) return;
+  const mevcutVal = sel.value;
+  const aktifler = DEPO_LISTE.filter(d => d.aktif);
+  sel.innerHTML = '<option value="">— Depo seçin —</option>' +
+    aktifler.map(d =>
+      `<option value="${d.kod} · ${d.ad}">${d.kod} · ${d.ad}${d.sehir ? ' (' + d.sehir + ')' : ''}</option>`
+    ).join('');
+  if (mevcutVal) sel.value = mevcutVal;
+}
+
+// Yeni boş depo satırı ekle
+window.yeniDepoEkle = () => {
+  // Mevcut en yüksek numarayı bul
+  const nums = DEPO_LISTE.map(d => parseInt(d.kod.replace('D-',''))).filter(n => !isNaN(n));
+  const yeniNum = Math.max(...nums, 0) + 1;
+  const yeniKod = 'D-' + String(yeniNum).padStart(2,'0');
+  DEPO_LISTE.push({kod: yeniKod, ad: '', sehir: '', tip: 'Lojistik', alan: 0, aktif: true});
+  adminSayfasiYukle();
+  // Yeni satırın ad alanına odaklan
+  setTimeout(() => {
+    const satirlar = document.querySelectorAll('#depoAdTbody tr[data-kod]');
+    if (satirlar.length) {
+      const sonSatir = satirlar[satirlar.length - 1];
+      sonSatir.querySelector('.d-ad')?.focus();
+      sonSatir.scrollIntoView({behavior:'smooth', block:'center'});
+    }
+  }, 100);
+};
+
+// Satır sil
+window.depoSatirSil = (kod) => {
+  const kayitVar = Object.values(DATA).some(r => r.depo === kod);
+  if (kayitVar) {
+    if (!confirm(`${kod} deposuna ait kayıtlar var. Yine de listeden kaldırmak istiyor musunuz? (Kayıtlar silinmez, sadece listeden çıkar)`)) return;
+  }
+  DEPO_LISTE = DEPO_LISTE.filter(d => d.kod !== kod);
+  adminSayfasiYukle();
+  showToastAdmin(kod + ' listeden kaldırıldı');
+};
+
+// Listeyi kaydet
+window.depoListesiniKaydet = () => {
+  const satirlar = document.querySelectorAll('#depoAdTbody tr[data-kod]');
+  const yeniListe = [];
+  satirlar.forEach(satir => {
+    const kod = satir.dataset.kod;
+    const ad  = satir.querySelector('.d-ad')?.value.trim();
+    if (!ad) return; // boş isim varsa atla
+    yeniListe.push({
+      kod,
+      ad,
+      sehir: satir.querySelector('.d-sehir')?.value.trim() || '',
+      tip:   satir.querySelector('.d-tip')?.value || 'Lojistik',
+      alan:  parseFloat(satir.querySelector('.d-alan')?.value) || 0,
+      aktif: satir.querySelector('.d-aktif')?.checked ?? true
+    });
+  });
+  DEPO_LISTE = yeniListe;
+  // Firebase'e kaydet — tüm kullanıcılara yansısın
+  if (DEMO_MODE) {
+    localStorage.setItem('depo_liste', JSON.stringify(DEPO_LISTE));
+    depoSelectGuncelle();
+    if (typeof sayfaYenile === 'function') sayfaYenile();
+    showToastAdmin('✓ Depo listesi kaydedildi');
+  } else {
+    set(ref(db, 'ayarlar/depo_liste'), DEPO_LISTE)
+      .then(() => {
+        showToastAdmin('✓ Depo listesi kaydedildi — tüm kullanıcılara yansıdı');
+      })
+      .catch(e => showToastAdmin('Hata: ' + e.message, 'err'));
+  }
+};
+
+// depoAdlariniKaydet alias (geriye uyumluluk)
+window.depoAdlariniKaydet = window.depoListesiniKaydet;
+
+function sistemAyarlariniKaydet() {
+  SISTEM_AYAR.sirket    = document.getElementById('sa_sirket')?.value    || SISTEM_AYAR.sirket;
+  SISTEM_AYAR.elektrik  = parseFloat(document.getElementById('sa_elektrik')?.value) || SISTEM_AYAR.elektrik;
+  SISTEM_AYAR.su        = parseFloat(document.getElementById('sa_su')?.value)        || SISTEM_AYAR.su;
+  SISTEM_AYAR.gaz       = parseFloat(document.getElementById('sa_gaz')?.value)       || SISTEM_AYAR.gaz;
+  SISTEM_AYAR.girisGunu = parseInt(document.getElementById('sa_girisGunu')?.value)   || SISTEM_AYAR.girisGunu;
+  SISTEM_AYAR.filtre    = document.getElementById('sa_filtre')?.value || 'son';
+  localStorage.setItem('sistem_ayar', JSON.stringify(SISTEM_AYAR));
+  showToastAdmin('Sistem ayarları kaydedildi ✓');
+}
+
+// Admin sayfasını yükle
+window.adminSayfasiYukle = function adminSayfasiYukle() {
+  const tbody = document.getElementById('depoAdTbody');
+  if (!tbody) return;
+
+  // Bilgi satırı
+  const bilgi = document.getElementById('depoKayitBilgi');
+  if (bilgi) bilgi.textContent = DEPO_LISTE.length + ' depo listelendi';
+
+  tbody.innerHTML = DEPO_LISTE.map(d => {
+    const kayitSayisi = Object.values(DATA).filter(r => r.depo === d.kod).length;
+    const inputStyle = 'width:100%;padding:7px 10px;border:1.5px solid var(--border2);border-radius:6px;font-family:inherit;font-size:13px;outline:none;transition:border-color .15s;';
+    const focusAttr  = `onfocus="this.style.borderColor='var(--blue)'" onblur="this.style.borderColor='var(--border2)'"`;
+    return `
+    <tr data-kod="${d.kod}">
+      <td>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;
+          color:var(--blue);background:var(--blue-m);padding:3px 8px;border-radius:5px;">${d.kod}</span>
+      </td>
+      <td>
+        <input class="d-ad" value="${d.ad}" placeholder="Depo ismi yazın…"
+          style="${inputStyle}font-weight:600;" ${focusAttr}>
+      </td>
+      <td>
+        <input class="d-sehir" value="${d.sehir}" placeholder="Şehir"
+          style="${inputStyle}" ${focusAttr}>
+      </td>
+      <td>
+        <select class="d-tip" style="${inputStyle}">
+          <option ${d.tip==='Lojistik'?'selected':''}>Lojistik</option>
+          <option ${d.tip==='Kuru'?'selected':''}>Kuru</option>
+          <option ${d.tip==='Soğuk'?'selected':''}>Soğuk</option>
+        </select>
+      </td>
+      <td>
+        <input class="d-alan" type="number" value="${d.alan||''}" placeholder="0"
+          style="${inputStyle}font-family:'JetBrains Mono',monospace;" ${focusAttr}>
+      </td>
+      <td style="text-align:center">
+        <input class="d-aktif" type="checkbox" ${d.aktif?'checked':''}
+          style="width:16px;height:16px;cursor:pointer;accent-color:var(--blue)">
+      </td>
+      <td style="text-align:center">
+        <button onclick="depoSatirSil('${d.kod}')"
+          style="background:none;border:none;cursor:pointer;font-size:16px;color:var(--ink4);padding:2px 4px;"
+          title="Listeden kaldır">🗑</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // Kullanıcı tablosu
+  const utbody = document.getElementById('kullaniciTbody');
+  if (utbody) {
+    const ku = typeof KULLANICILAR !== 'undefined' ? Object.entries(KULLANICILAR) : [];
+    utbody.innerHTML = !ku.length
+      ? '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--ink3)">Kullanıcı tanımlanmamış</td></tr>'
+      : ku.map(([email, u]) => `<tr>
+          <td><strong>${u.ad}</strong></td>
+          <td class="td-mono" style="font-size:12px">${email}</td>
+          <td><span class="badge ${u.rol==='admin'?'b-blue':'b-green'}">${u.rol==='admin'?'👑 Yönetici':'📦 Depo'}</span></td>
+          <td>${u.depo||'<span style="color:var(--ink4)">Tümü</span>'}</td>
+          <td><span class="badge b-green">Aktif</span></td>
+        </tr>`).join('');
+  }
+
+  // Sistem ayarları
+  const sa = SISTEM_AYAR;
+  const sv = (id,v) => { const el=document.getElementById(id); if(el) el.value=v||''; };
+  sv('sa_sirket',sa.sirket); sv('sa_elektrik',sa.elektrik);
+  sv('sa_su',sa.su); sv('sa_gaz',sa.gaz); sv('sa_girisGunu',sa.girisGunu);
+  const sf=document.getElementById('sa_filtre'); if(sf) sf.value=sa.filtre||'son';
+
+  // İstatistikler
+  const rows = typeof DATA!=='undefined' ? Object.values(DATA) : [];
+  const s=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v;};
+  s('adminToplamKayit',rows.length);
+  s('adminDonemSayisi',[...new Set(rows.map(r=>r.donem))].length);
+  s('adminDepoSayisi',[...new Set(rows.map(r=>r.depo))].length);
+}
+
+function veriDisaAktar() {
+  const k = typeof DATA!=='undefined' ? DATA : {};
+  const blob = new Blob([JSON.stringify({kayitlar:k, depo_liste:DEPO_LISTE},null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='depo_enerji_yedek_'+new Date().toISOString().slice(0,10)+'.json'; a.click();
+  showToastAdmin('JSON indirildi');
+}
+
+function veriCSVIndir() {
+  const rows = typeof DATA!=='undefined' ? Object.values(DATA) : [];
+  if(!rows.length){showToastAdmin('Veri yok','err');return;}
+  const h=['Kod','Depo Adı','Dönem','Doluluk%','Alan_m2','Palet','Elektrik_kWh','Su_m3','Gaz_m3','kWh/m2','kWh/Palet','Su/m2','Gaz/m2','Skor','Giren','Tarih'];
+  const s=rows.map(r=>[r.depo,depoAd(r.depo),r.donem,r.doluluk,r.alan,r.palet,r.elektrik,r.su,r.gaz,
+    (r.kwh_m2||0).toFixed(2),(r.kwh_pal||0).toFixed(2),(r.su_m2||0).toFixed(4),(r.gaz_m2||0).toFixed(4),
+    r.skor||'',r.giren||'',r.girisTarihi||''].join(';'));
+  const csv='\uFEFF'+[h.join(';'),...s].join('\n');
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='depo_enerji_'+new Date().toISOString().slice(0,10)+'.csv'; a.click();
+  showToastAdmin('CSV indirildi');
+}
+
+function eskiVeriSil() {
+  const sinir=new Date(); sinir.setMonth(sinir.getMonth()-12);
+  const sm=sinir.getFullYear()+'-'+String(sinir.getMonth()+1).padStart(2,'0');
+  if(!confirm(sm+' öncesi veriler silinecek. Emin misiniz?')) return;
+  if(typeof DATA==='undefined') return;
+  let n=0; Object.keys(DATA).forEach(k=>{if(DATA[k].donem<sm){delete DATA[k];n++;}});
+  if(typeof kaydet==='function') kaydet();
+  showToastAdmin(n+' eski kayıt silindi'); adminSayfasiYukle();
+}
+
+function showToastAdmin(msg,type='ok'){
+  if(typeof showToast==='function') showToast(msg,type); else alert(msg);
+}
+
+
+window.addEventListener('load', () => {
+  setTimeout(depoSelectGuncelle, 400);
+});
+
+});
+
+
+
+// ════════════════════════════════════════════
+// ADMIN PANEL JS (module scope içine taşındı)
+// ════════════════════════════════════════════
+
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root {
+  --bg:#f4f6f9;--bg1:#fff;--bg2:#f8f9fb;--border:#e2e6ed;--border2:#c8cfd8;
+  --ink:#1a1d23;--ink2:#3d4352;--ink3:#6b7280;--ink4:#9ca3af;
+  --blue:#2563eb;--blue-l:#eff6ff;--blue-m:#dbeafe;
+  --green:#059669;--green-l:#ecfdf5;--amber:#d97706;--amber-l:#fffbeb;
+  --red:#dc2626;--red-l:#fef2f2;--r:8px;--r-lg:12px;
+  --shadow:0 1px 4px rgba(0,0,0,.07),0 4px 16px rgba(0,0,0,.04);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--ink);font-size:14px;line-height:1.5;}
+::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px;}
+
+/* LOGIN */
+#loginScreen{display:flex;position:fixed;inset:0;background:linear-gradient(135deg,#0f172a,#1e3a5f);z-index:1000;align-items:center;justify-content:center;}
+.login-box{background:#fff;border-radius:16px;padding:40px 36px;width:380px;box-shadow:0 20px 60px rgba(0,0,0,.3);}
+.login-logo{font-size:32px;text-align:center;margin-bottom:8px;}
+.login-title{font-size:20px;font-weight:700;text-align:center;margin-bottom:4px;}
+.login-sub{font-size:13px;color:var(--ink3);text-align:center;margin-bottom:24px;}
+.login-field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px;}
+.login-field label{font-size:12px;font-weight:600;color:var(--ink2);}
+.login-field input{padding:10px 13px;border:1.5px solid var(--border2);border-radius:var(--r);font-size:14px;font-family:inherit;outline:none;transition:border-color .15s;}
+.login-field input:focus{border-color:var(--blue);}
+.login-err{font-size:12px;color:var(--red);text-align:center;margin-bottom:8px;min-height:16px;}
+.login-btn{width:100%;padding:11px;background:var(--blue);color:#fff;border:none;border-radius:var(--r);font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s;}
+.login-btn:hover{background:#1d4ed8;}
+.login-demo{text-align:center;font-size:12px;color:var(--ink3);margin-top:14px;}
+.login-demo span{color:var(--blue);cursor:pointer;font-weight:600;}
+
+/* APP */
+#appShell{display:none;}
+.topnav{background:var(--ink);color:#fff;padding:0 24px;display:flex;align-items:center;gap:0;position:sticky;top:0;z-index:200;height:50px;}
+.nav-logo{font-size:15px;font-weight:700;color:#fff;margin-right:24px;white-space:nowrap;}
+.nav-logo span{color:#60a5fa;}
+.nav-tab{padding:0 16px;height:50px;display:flex;align-items:center;font-size:13px;font-weight:500;color:rgba(255,255,255,.55);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap;background:none;border-top:none;border-left:none;border-right:none;}
+.nav-tab:hover{color:rgba(255,255,255,.85);}
+.nav-tab.active{color:#fff;border-bottom-color:#60a5fa;}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px;}
+.user-chip{display:flex;align-items:center;gap:7px;background:rgba(255,255,255,.08);border-radius:20px;padding:5px 12px;}
+.user-name{font-size:12px;font-weight:600;color:#fff;}
+.user-rol{font-size:11px;color:rgba(255,255,255,.5);}
+.nav-badge{background:#059669;color:#fff;font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;}
+.logout-btn{background:none;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.6);padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;}
+.logout-btn:hover{color:#fff;}
+
+/* DEMO BANNER */
+.demo-banner{background:#fef3c7;border-bottom:1px solid #fde68a;padding:8px 24px;font-size:12px;color:#92400e;display:flex;align-items:center;gap:8px;}
+
+.page{display:none;padding:24px;max-width:1080px;margin:0 auto;}
+.page.active{display:block;}
+.card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--shadow);}
+.card-hd{padding:16px 22px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.card-title{font-size:14px;font-weight:700;color:var(--ink);}
+.card-sub{font-size:12px;color:var(--ink3);margin-top:1px;}
+.card-body{padding:18px 22px;}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;}
+.form-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px;}
+.field{display:flex;flex-direction:column;gap:4px;}
+.field label{font-size:12px;font-weight:600;color:var(--ink2);}
+.field .hint{font-size:11px;color:var(--ink4);}
+.field input,.field select{padding:9px 12px;border:1.5px solid var(--border2);border-radius:var(--r);font-size:14px;font-family:inherit;color:var(--ink);background:var(--bg1);outline:none;transition:border-color .15s;}
+.field input:focus,.field select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.08);}
+.section-label{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);margin:16px 0 8px;grid-column:1/-1;display:flex;align-items:center;gap:8px;}
+.section-label::after{content:'';flex:1;height:1px;background:var(--border);}
+.btn{padding:9px 18px;border-radius:var(--r);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;border:none;}
+.btn-primary{background:var(--blue);color:#fff;}.btn-primary:hover{background:#1d4ed8;}
+.btn-primary:disabled{opacity:.6;cursor:not-allowed;}
+.btn-secondary{background:var(--bg2);border:1.5px solid var(--border2);color:var(--ink2);}.btn-secondary:hover{border-color:var(--blue);color:var(--blue);}
+.btn-danger{background:var(--red-l);border:1.5px solid rgba(220,38,38,.2);color:var(--red);}
+.btn-sm{padding:5px 11px;font-size:12px;}
+.btn-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;}
+.b-blue{background:var(--blue-m);color:var(--blue);}
+.b-green{background:var(--green-l);color:var(--green);}
+.b-amber{background:var(--amber-l);color:var(--amber);}
+.b-red{background:var(--red-l);color:var(--red);}
+.b-gray{background:var(--bg2);color:var(--ink3);border:1px solid var(--border);}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px;margin-bottom:18px;}
+.kpi-card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-lg);padding:13px 15px;box-shadow:var(--shadow);}
+.kpi-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ink3);margin-bottom:5px;}
+.kpi-val{font-size:24px;font-weight:700;color:var(--ink);line-height:1;}
+.kpi-unit{font-size:12px;font-weight:400;color:var(--ink3);}
+.kpi-delta{font-size:11px;margin-top:4px;font-weight:500;}
+.tbl-wrap{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border);}
+table{width:100%;border-collapse:collapse;font-size:12.5px;}
+thead tr{background:var(--bg2);}
+th{padding:8px 11px;text-align:left;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--ink3);border-bottom:1px solid var(--border);white-space:nowrap;}
+td{padding:8px 11px;border-bottom:1px solid var(--border);color:var(--ink2);vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+tbody tr:hover td{background:var(--blue-l);}
+.td-mono{font-family:'JetBrains Mono',monospace;font-size:12px;}
+.td-mini{font-size:11px;white-space:nowrap;}
+.text-muted{color:var(--ink3);}
+.score-bar-wrap{display:flex;align-items:center;gap:7px;}
+.score-bar-track{flex:1;height:7px;background:var(--bg2);border-radius:4px;overflow:hidden;min-width:50px;}
+.score-bar-fill{height:100%;border-radius:4px;transition:width .4s;}
+.score-num{font-size:12px;font-weight:700;width:26px;text-align:right;font-family:'JetBrains Mono',monospace;}
+.alert{display:flex;align-items:flex-start;gap:10px;padding:10px 13px;border-radius:var(--r);border:1px solid;}
+.alert-icon{font-size:15px;flex-shrink:0;}
+.alert-title{font-size:12.5px;font-weight:700;margin-bottom:1px;}
+.alert-body{font-size:12px;opacity:.85;}
+.alert-red{background:var(--red-l);border-color:rgba(220,38,38,.2);color:var(--red);}
+.alert-amber{background:var(--amber-l);border-color:rgba(217,119,6,.2);color:var(--amber);}
+.alert-green{background:var(--green-l);border-color:rgba(5,150,105,.2);color:var(--green);}
+.chart-card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-lg);padding:15px 18px;box-shadow:var(--shadow);}
+.chart-title{font-size:13px;font-weight:700;color:var(--ink);margin-bottom:13px;}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+.three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+.month-nav{display:flex;align-items:center;gap:10px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r);padding:7px 12px;width:fit-content;}
+.month-nav button{background:none;border:none;cursor:pointer;color:var(--ink3);font-size:16px;padding:1px 5px;border-radius:4px;}
+.month-nav button:hover{background:var(--bg2);color:var(--ink);}
+.month-nav .month-label{font-size:13px;font-weight:700;color:var(--ink);min-width:100px;text-align:center;}
+.hm-cell{border-radius:4px;padding:5px 2px;text-align:center;font-size:10px;font-weight:600;}
+.hm-1{background:#d1fae5;color:#065f46;}.hm-2{background:#6ee7b7;color:#064e3b;}
+.hm-3{background:#fef3c7;color:#92400e;}.hm-4{background:#fde68a;color:#78350f;}
+.hm-5{background:#fecaca;color:#991b1b;}.hm-6{background:#f87171;color:#7f1d1d;}
+#reportPreview{background:#fff;border:1px solid var(--border);border-radius:var(--r-lg);padding:32px 36px;margin-top:14px;box-shadow:var(--shadow);}
+@media print{body *{visibility:hidden;}#reportPreview,#reportPreview *{visibility:visible;}#reportPreview{position:fixed;left:0;top:0;width:100%;padding:20px;box-shadow:none;border:none;}}
+.empty{text-align:center;padding:40px 20px;}
+.empty-icon{font-size:40px;margin-bottom:10px;}
+.empty-title{font-size:15px;font-weight:700;color:var(--ink2);margin-bottom:5px;}
+.empty-sub{font-size:12px;color:var(--ink3);}
+.toast{position:fixed;bottom:22px;right:22px;background:var(--ink);color:#fff;padding:11px 16px;border-radius:var(--r-lg);font-size:13px;font-weight:500;box-shadow:0 8px 24px rgba(0,0,0,.2);transform:translateY(80px);opacity:0;transition:all .3s;z-index:999;display:flex;align-items:center;gap:8px;}
+.toast.show{transform:translateY(0);opacity:1;}
+.divider{height:1px;background:var(--border);margin:16px 0;}
+.mt-16{margin-top:16px;}.mt-20{margin-top:20px;}.mb-16{margin-bottom:16px;}.mb-20{margin-bottom:20px;}
+.flex{display:flex;}.items-center{align-items:center;}.gap-8{gap:8px;}.gap-12{gap:12px;}
+.text-sm{font-size:12px;}.text-xs{font-size:11px;}.fw-700{font-weight:700;}
+
+/* KURULUM KILAVUZU */
+.setup-step{display:flex;gap:14px;padding:14px 0;border-bottom:1px solid var(--border);}
+.setup-step:last-child{border:none;}
+.step-num{width:28px;height:28px;border-radius:50%;background:var(--blue);color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.step-content .step-title{font-size:13px;font-weight:700;margin-bottom:3px;}
+.step-content .step-desc{font-size:12px;color:var(--ink3);line-height:1.6;}
+code{font-family:'JetBrains Mono',monospace;font-size:11.5px;background:var(--bg2);padding:1px 5px;border-radius:4px;color:#2563eb;}
+</style>
+</head>
+<body>
+
+<!-- ══ GİRİŞ EKRANI ══ -->
+<div id="loginScreen">
+  <div class="login-box">
+    <div class="login-logo">📦</div>
+    <div class="login-title">Depo Enerji Takip</div>
+    <div class="login-sub">Sisteme giriş yapın</div>
+    <div class="login-field">
+      <label>E-posta</label>
+      <input type="email" id="loginEmail" placeholder="kullanici@sirket.com" autocomplete="email">
+    </div>
+    <div class="login-field">
+      <label>Şifre</label>
+      <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <div class="login-err" id="loginErr"></div>
+    <button class="login-btn" id="loginBtn" onclick="girisBtnClick()">Giriş Yap</button>
+    <div class="login-demo">Demo modda deneyin: <span onclick="document.getElementById('loginBtn').click()">Direkt giriş →</span></div>
+  </div>
+</div>
+
+<!-- ══ UYGULAMA ══ -->
+<div id="appShell">
+
+  <!-- Demo banner -->
+  <div class="demo-banner" id="demoBanner" style="display:none">
+    ⚠️ <strong>Demo Modu</strong> — Veriler yalnızca bu oturumda geçerli. Firebase kurulumu yapıldığında tüm kullanıcılar aynı veriye erişir.
+    <a href="#pg-kurulum" onclick="goPage('pg-kurulum', null)" style="color:#92400e;font-weight:700;margin-left:8px;">Kurulum Kılavuzu →</a>
+  </div>
+
+  <!-- NAV -->
+  <nav class="topnav">
+    <div class="nav-logo">📦 Depo <span>Enerji</span></div>
+    <button class="nav-tab active" onclick="goPage('pg-giris',this)">📝 Veri Girişi</button>
+    <button class="nav-tab" onclick="goPage('pg-analiz',this)">📊 Analiz</button>
+    <button class="nav-tab" onclick="goPage('pg-uyarilar',this)">🔔 Uyarılar <span id="alertCount" style="background:#dc2626;color:#fff;font-size:10px;font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px;display:none">0</span></button>
+    <button class="nav-tab" id="navSiralama" onclick="goPage('pg-karsilastirma',this)">🏆 Sıralama</button>
+    <button class="nav-tab" id="navRapor" onclick="goPage('pg-rapor',this)">📄 Rapor</button>
+    <button class="nav-tab" id="navAdmin" onclick="goPage('pg-admin',this);setTimeout(()=>window.adminSayfasiYukle&&window.adminSayfasiYukle(),100)">🛠️ Yönetim</button>
+    <button class="nav-tab" onclick="goPage('pg-kurulum',this)">⚙️ Kurulum</button>
+    <div class="nav-right">
+      <div class="user-chip">
+        <div>
+          <div class="user-name" id="userLabel">—</div>
+          <div class="user-rol" id="userRol">—</div>
+        </div>
+      </div>
+      <span class="nav-badge" id="kayitSayisi">0 kayıt</span>
+      <span style="font-size:11px;color:rgba(255,255,255,.4)" id="aktifKullanici"></span>
+      <button class="logout-btn" onclick="cikisYap()">Çıkış</button>
+    </div>
+  </nav>
+
+  <!-- ════ VERİ GİRİŞİ ════ -->
+  <div id="pg-giris" class="page active">
+    <div class="card mb-20">
+      <div class="card-hd">
+        <div>
+          <div class="card-title">Aylık Veri Girişi</div>
+          <div class="card-sub">Her ay, her depo için bir kez doldurun. Kaydettiğinizde tüm ekip anında görür.</div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-secondary btn-sm" onclick="formTemizle()">Temizle</button>
+          <button class="btn btn-primary" id="kaydetBtn" onclick="veriKaydet()">💾 Kaydet & Analiz Et</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="section-label">📍 Temel Bilgiler</div>
+          <div class="field">
+            <label>Depo <span style="color:var(--red)">*</span></label>
+            <select id="f_depo">
+              <option value="">— Depo seçin —</option>
+            </select>
+            <span class="hint">Hangi depoyu giriyorsunuz?</span>
+          </div>
+          <div class="field">
+            <label>Dönem <span style="color:var(--red)">*</span></label>
+            <input type="month" id="f_donem">
+            <span class="hint">Verinin ait olduğu ay</span>
+          </div>
+          <div class="section-label">📏 Kullanım</div>
+          <div class="field">
+            <label>Doluluk Oranı (%) <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_doluluk" min="0" max="100" step="0.1" placeholder="örn: 78.5">
+            <span class="hint">0–100 arası</span>
+          </div>
+          <div class="field">
+            <label>Kullanılan Alan (m²) <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_alan" min="0" placeholder="örn: 4250">
+          </div>
+          <div class="field">
+            <label>Toplam Palet <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_palet" min="0" placeholder="örn: 1840">
+            <span class="hint">Ay sonu sayım</span>
+          </div>
+          <div class="field"><!-- boşluk --></div>
+          <div class="section-label">⚡ Sayaç Değerleri</div>
+          <div class="field">
+            <label>Elektrik (kWh) <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_elektrik" min="0" placeholder="örn: 13600">
+            <span class="hint">Elektrik sayacından</span>
+          </div>
+          <div class="field">
+            <label>Su (m³) <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_su" min="0" step="0.01" placeholder="örn: 170">
+            <span class="hint">Su sayacından</span>
+          </div>
+          <div class="field">
+            <label>Doğalgaz (m³) <span style="color:var(--red)">*</span></label>
+            <input type="number" id="f_gaz" min="0" step="0.01" placeholder="örn: 510">
+            <span class="hint">Gaz sayacından</span>
+          </div>
+          <div class="field">
+            <label>Not</label>
+            <input type="text" id="f_not" placeholder="Arıza, bakım, kampanya…">
+          </div>
+        </div>
+        <div id="onizleme" style="display:none;margin-top:18px;">
+          <div class="divider"></div>
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--ink3);margin-bottom:9px;">⚡ Anlık Hesaplama</div>
+          <div class="kpi-row" id="onizlemeKpiRow"></div>
+          <div id="onizlemeUyari"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hd">
+        <div><div class="card-title">Kaydedilen Veriler</div><div class="card-sub">Tüm kullanıcıların girişleri • Kim girdi bilgisi görünür</div></div>
+        <div class="flex gap-8 items-center">
+          <input type="month" id="filterDonem" onchange="tabloGoster()" style="padding:6px 10px;border:1.5px solid var(--border2);border-radius:var(--r);font-family:inherit;font-size:12px;outline:none;">
+        </div>
+      </div>
+      <div class="card-body" style="padding:0;">
+        <div class="tbl-wrap">
+          <table id="veriTablosu">
+            <thead><tr>
+              <th>Depo</th><th>Dönem</th><th>Doluluk</th><th>Alan m²</th><th>Palet</th>
+              <th>kWh</th><th>kWh/m²</th><th>Skor</th><th>Durum</th>
+              <th>Giren</th><th>Tarih</th><th>İşlemler</th>
+            </tr></thead>
+            <tbody id="veriTbody">
+              <tr><td colspan="12"><div class="empty"><div class="empty-icon">📋</div><div class="empty-title">Henüz veri yok</div><div class="empty-sub">Formu doldurun ve kaydedin.</div></div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════ ANALİZ ════ -->
+  <div id="pg-analiz" class="page">
+    <div class="flex items-center gap-12 mb-20" style="justify-content:space-between;flex-wrap:wrap;">
+      <div><div style="font-size:20px;font-weight:700">Aylık Performans Analizi</div>
+      <div class="text-sm text-muted" style="margin-top:3px">Anlık güncellenir — veri girildiği anda değişir</div></div>
+      <div class="month-nav">
+        <button onclick="analizAyDegistir(-1)">‹</button>
+        <div class="month-label" id="analizAyLabel">—</div>
+        <button onclick="analizAyDegistir(+1)">›</button>
+      </div>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi-card"><div class="kpi-lbl">Ort. kWh/m²</div><div class="kpi-val" id="ak1">—</div></div>
+      <div class="kpi-card"><div class="kpi-lbl">Ort. kWh/Palet</div><div class="kpi-val" id="ak2">—</div></div>
+      <div class="kpi-card"><div class="kpi-lbl">Ort. Su/m²</div><div class="kpi-val" id="ak3">—</div></div>
+      <div class="kpi-card"><div class="kpi-lbl">Ort. Gaz/m²</div><div class="kpi-val" id="ak4">—</div></div>
+      <div class="kpi-card"><div class="kpi-lbl">Ort. Doluluk</div><div class="kpi-val" id="ak5">—</div></div>
+      <div class="kpi-card" style="border-color:var(--blue);background:var(--blue-l)"><div class="kpi-lbl">Giren Depo</div><div class="kpi-val" id="ak6" style="color:var(--blue)">0</div><div class="kpi-delta" style="color:var(--blue)">/ 15</div></div>
+    </div>
+    <div class="two-col mb-16">
+      <div class="chart-card"><div class="chart-title">Verimlilik Skoru</div><div id="skorListesi"><div class="empty" style="padding:20px"><div class="empty-sub">Veri bekleniyor</div></div></div></div>
+      <div class="chart-card"><div class="chart-title">kWh/m² Dağılımı</div><div id="kwhBarListesi"><div class="empty" style="padding:20px"><div class="empty-sub">Veri bekleniyor</div></div></div></div>
+    </div>
+    <div class="card">
+      <div class="card-hd"><div class="card-title">Dönem Detay Tablosu</div></div>
+      <div class="card-body" style="padding:0;">
+        <div class="tbl-wrap">
+          <table><thead><tr><th>Depo</th><th>Doluluk</th><th>kWh/m²</th><th>kWh/Palet</th><th>Su/m²</th><th>Gaz/m²</th><th>Verimlilik Skoru</th><th>Durum</th><th>Veri Giren</th></tr></thead>
+          <tbody id="analizTbody"><tr><td colspan="9"><div class="empty" style="padding:20px"><div class="empty-sub">Veri bekleniyor</div></div></td></tr></tbody></table>
+        </div>
+      </div>
+    </div>
+    <div class="card mt-16">
+      <div class="card-hd">
+        <div class="card-title">Isı Haritası — kWh/m² (Son 6 Ay)</div>
+        <div class="text-sm text-muted">🟢 İyi · 🟡 Dikkat · 🔴 Müdahale</div>
+      </div>
+      <div class="card-body"><div id="heatmapGrid"><div class="empty" style="padding:16px"><div class="empty-sub">Birden fazla ay verisi girildiğinde oluşur</div></div></div></div>
+    </div>
+  </div>
+
+  <!-- ════ UYARILAR ════ -->
+  <div id="pg-uyarilar" class="page">
+    <div style="font-size:20px;font-weight:700;margin-bottom:5px">Otomatik Uyarı Sistemi</div>
+    <div class="text-sm text-muted mb-20">Tüm kullanıcıların girdiği veriler eşik değerleriyle karşılaştırılır</div>
+    <div class="card mb-20">
+      <div class="card-hd"><div class="card-title">Eşik Değerleri</div><div class="card-sub">İstediğiniz zaman değiştirebilirsiniz</div></div>
+      <div class="card-body">
+        <div class="form-grid-3">
+          <div class="field"><label>kWh/m² Eşiği</label><input type="number" id="th_kwh" value="4.0" step="0.1" onchange="uyarilariHesapla()"><span class="hint">Bu değerin üstü = uyarı</span></div>
+          <div class="field"><label>Min. Doluluk (%)</label><input type="number" id="th_doluluk" value="60" onchange="uyarilariHesapla()"><span class="hint">Bu değerin altı = dikkat</span></div>
+          <div class="field"><label>MoM Artış Eşiği (%)</label><input type="number" id="th_mom" value="25" onchange="uyarilariHesapla()"><span class="hint">Aylık artış sınırı</span></div>
+        </div>
+      </div>
+    </div>
+    <div id="uyariListesi"><div class="empty"><div class="empty-icon">🔔</div><div class="empty-title">Uyarı yok</div><div class="empty-sub">Veri girildiğinde sistem otomatik kontrol eder</div></div></div>
+  </div>
+
+  <!-- ════ SIRALAMA ════ -->
+  <div id="pg-karsilastirma" class="page">
+    <div style="font-size:20px;font-weight:700;margin-bottom:5px">Depo Sıralaması</div>
+    <div class="text-sm text-muted mb-20">En son dönem verilerine göre — anlık güncellenir</div>
+    <div class="two-col mb-16">
+      <div class="card" style="border-color:rgba(5,150,105,.3);background:var(--green-l)">
+        <div class="card-hd" style="border-color:rgba(5,150,105,.2)"><div><div class="card-title" style="color:var(--green)">🏆 En Verimli 3</div><div class="card-sub">Örnek alınacak depolar</div></div></div>
+        <div class="card-body" id="enIyi3"><div class="empty" style="padding:12px"><div class="empty-sub">Veri bekleniyor</div></div></div>
+      </div>
+      <div class="card" style="border-color:rgba(220,38,38,.3);background:var(--red-l)">
+        <div class="card-hd" style="border-color:rgba(220,38,38,.2)"><div><div class="card-title" style="color:var(--red)">⚠️ İyileştirme Gereken 3</div><div class="card-sub">Öncelikli aksiyon gerektiriyor</div></div></div>
+        <div class="card-body" id="enKotu3"><div class="empty" style="padding:12px"><div class="empty-sub">Veri bekleniyor</div></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hd"><div class="card-title">Tam Sıralama</div></div>
+      <div class="card-body" id="tamSiralama"><div class="empty"><div class="empty-icon">🏅</div><div class="empty-sub">Veri girilince otomatik oluşur</div></div></div>
+    </div>
+  </div>
+
+  <!-- ════ RAPOR ════ -->
+  <div id="pg-rapor" class="page">
+    <div class="flex items-center gap-12 mb-20" style="justify-content:space-between;flex-wrap:wrap;">
+      <div><div style="font-size:20px;font-weight:700">Aylık Yönetici Raporu</div>
+      <div class="text-sm text-muted mt-4">Otomatik oluşturulur — PDF olarak yazdırın</div></div>
+      <div class="flex gap-8">
+        <select id="raporAy" onchange="raporOlustur()" style="padding:8px 12px;border:1.5px solid var(--border2);border-radius:var(--r);font-family:inherit;font-size:13px;outline:none;"><option value="">— Ay seçin —</option></select>
+        <button class="btn btn-primary" onclick="window.print()">🖨 PDF Yazdır</button>
+      </div>
+    </div>
+    <div id="reportPreview"><div class="empty"><div class="empty-icon">📄</div><div class="empty-title">Rapor oluşturulmadı</div><div class="empty-sub">Yukarıdan ay seçin.</div></div></div>
+  </div>
+
+  <!-- ════ KURULUM KILAVUZU ════ -->
+  <div id="pg-kurulum" class="page">
+    <div style="font-size:20px;font-weight:700;margin-bottom:5px">⚙️ Firebase Kurulum Kılavuzu</div>
+    <div class="text-sm text-muted mb-20">IT desteği olmadan 15 dakikada kurulum — adım adım</div>
+
+    <div class="card mb-16" style="border-color:rgba(37,99,235,.3);background:var(--blue-l)">
+      <div class="card-body">
+        <div style="font-size:13px;font-weight:700;color:var(--blue);margin-bottom:6px">🎯 Neden Firebase?</div>
+        <div style="font-size:13px;color:var(--ink2);line-height:1.7">
+          Firebase Google'ın ücretsiz bulut veritabanı. Sunuc        Firebase Google'ın ücretsiz bulut veritabanı. Sunucu kurmanıza gerek yok. Linki paylaştığınızda tüm kullanıcılar aynı veriye gerçek zamanlı erişir. <strong>5–10 kullanıcı ve aylık veri girişi için ücretsiz plan tamamen yeterli.</strong>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-hd"><div class="card-title">Kullanıcı Listesi Şablonu</div></div>
+      <div class="card-body">
+        <pre style="background:#0f172a;color:#abb2bf;border-radius:8px;padding:18px;font-size:12px;overflow-x:auto;line-height:1.7;">const KULLANICILAR = {
+  "yonetici@sirket.com":  { ad: "Genel Müdür",    rol: "admin", depo: null  },
+  "d01@sirket.com":       { ad: "D-01 Sorumlusu", rol: "depo",  depo: "D-01" },
+  // rol:"admin" → tüm depolar, rapor ve sıralama
+  // rol:"depo"  → yalnızca kendi deposu
+};</pre>
+      </div>
+    </div>
+  </div><!-- /pg-kurulum -->
+
+  <!-- ════ YÖNETİM PANELİ ════ -->
+  <div id="pg-admin" class="page">
+    <div style="font-size:20px;font-weight:700;margin-bottom:5px">🛠️ Yönetim Paneli</div>
+    <div class="text-sm text-muted mb-20">Kayıtlı depo adlarını düzenleyin, sistem ayarlarını ve kullanıcıları yönetin</div>
+
+    <!-- DEPO ADLARI -->
+    <div class="card mb-16">
+      <div class="card-hd">
+        <div>
+          <div class="card-title">📦 Depo Listesini Yönet</div>
+          <div class="card-sub">Depo kodlarını, isimlerini ve aktif/pasif durumunu buradan ayarlayın — form listesi anında güncellenir</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-secondary btn-sm" onclick="yeniDepoEkle()">+ Yeni Depo</button>
+          <button class="btn btn-primary btn-sm" onclick="depoListesiniKaydet()">💾 Kaydet</button>
+        </div>
+      </div>
+      <div style="padding:10px 22px;background:#eff6ff;border-bottom:1px solid rgba(37,99,235,0.12);font-size:12px;color:#1e40af;">
+        ℹ️ <strong>Kod</strong> değişmez (sistem tanımlayıcısı). <strong>İsim</strong>, şehir ve tip düzenlenebilir. Aktif olmayanlar form listesinde görünmez.
+      </div>
+      <div class="card-body" style="padding:0;">
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr>
+              <th style="width:70px">Kod</th>
+              <th>Depo İsmi <span style="font-weight:400;color:var(--ink4);text-transform:none;letter-spacing:0">✏️</span></th>
+              <th style="width:120px">Şehir</th>
+              <th style="width:110px">Tip</th>
+              <th style="width:110px">Alan (m²)</th>
+              <th style="width:52px;text-align:center">Aktif</th>
+              <th style="width:40px"></th>
+            </tr></thead>
+            <tbody id="depoAdTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- KULLANICI YÖNETİMİ -->
+    <div class="card mb-16">
+      <div class="card-hd">
+        <div>
+          <div class="card-title">👥 Kullanıcı Listesi</div>
+          <div class="card-sub">Firebase Authentication'daki kullanıcıları burada görüntüleyin. Şifre için Firebase Console kullanılır.</div>
+        </div>
+      </div>
+      <div class="card-body" style="padding:0;">
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Ad Soyad</th><th>E-posta</th><th>Rol</th><th>Yetkili Depo</th><th>Durum</th></tr></thead>
+            <tbody id="kullaniciTbody"></tbody>
+          </table>
+        </div>
+        <div style="padding:14px 18px;border-top:1px solid var(--border);background:var(--bg2);">
+          <div style="font-size:12px;color:var(--ink3);">
+            💡 Yeni kullanıcı eklemek için: <strong>Firebase Console → Authentication → Users → Add user</strong><br>
+            Ardından bu dosyadaki <code>KULLANICILAR</code> sabitine e-postayı ekleyin ve rol/depo atayın.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SİSTEM AYARLARI -->
+    <div class="card mb-16">
+      <div class="card-hd">
+        <div>
+          <div class="card-title">⚙️ Sistem Ayarları</div>
+          <div class="card-sub">Enerji birim fiyatları ve genel ayarlar</div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="sistemAyarlariniKaydet()">💾 Kaydet</button>
+      </div>
+      <div class="card-body">
+        <div class="form-grid-3">
+          <div class="field">
+            <label>Elektrik Tarifesi (₺/kWh)</label>
+            <input type="number" id="sa_elektrik" step="0.01" placeholder="4.85">
+            <span class="hint">Güncel sanayi tarifesi</span>
+          </div>
+          <div class="field">
+            <label>Su Tarifesi (₺/m³)</label>
+            <input type="number" id="sa_su" step="0.01" placeholder="38.50">
+          </div>
+          <div class="field">
+            <label>Doğalgaz Tarifesi (₺/m³)</label>
+            <input type="number" id="sa_gaz" step="0.01" placeholder="12.20">
+          </div>
+          <div class="field">
+            <label>Şirket Adı</label>
+            <input type="text" id="sa_sirket" placeholder="Şirket adınız">
+            <span class="hint">Raporlarda görünür</span>
+          </div>
+          <div class="field">
+            <label>Veri Giriş Günü (ayın kaçı)</label>
+            <input type="number" id="sa_girisGunu" min="1" max="31" placeholder="5">
+            <span class="hint">Hatırlatma için</span>
+          </div>
+          <div class="field">
+            <label>Varsayılan Dönem Filtresi</label>
+            <select id="sa_filtre">
+              <option value="son">Son ay</option>
+              <option value="tumü">Tümü</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VERİ YÖNETİMİ -->
+    <div class="card">
+      <div class="card-hd">
+        <div>
+          <div class="card-title">🗄️ Veri Yönetimi</div>
+          <div class="card-sub">Yedekleme ve temizlik işlemleri</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="veriDisaAktar()">📥 Tüm Veriyi JSON İndir</button>
+          <button class="btn btn-secondary" onclick="veriCSVIndir()">📊 CSV İndir (Excel için)</button>
+          <button class="btn btn-danger" onclick="eskiVeriSil()">🗑️ 12 Aydan Eski Verileri Sil</button>
+        </div>
+        <div style="margin-top:14px;padding:12px 14px;background:var(--bg2);border-radius:var(--r);font-size:12px;color:var(--ink3);">
+          <strong>Toplam kayıt:</strong> <span id="adminToplamKayit">—</span> &nbsp;·&nbsp;
+          <strong>Dönem sayısı:</strong> <span id="adminDonemSayisi">—</span> &nbsp;·&nbsp;
+          <strong>Depo sayısı:</strong> <span id="adminDepoSayisi">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /appShell -->
+<div class="toast" id="toast"></div>
+</body>
+</html>
